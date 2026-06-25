@@ -1,0 +1,44 @@
+{
+  "expo": {
+    "name": "MotoTrack",
+    "slug": "mototrack",
+    "scheme": "mototrack",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "platforms": [
+      "ios"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.filipmirkovic.mototrack",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "MotoTrack needs Bluetooth to connect to your motorcycle telemetry device.",
+        "NSLocationWhenInUseUsageDescription": "MotoTrack needs location access for GPS ride tracking.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "modes": [
+            "central"
+          ]
+        }
+      ],
+      "expo-sqlite",
+      "expo-status-bar",
+      "expo-font"
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7b551c18-6795-4a8a-bf3d-33fc4ee7b291"
+      }
+    }
+  }
+}
