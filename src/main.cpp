@@ -109,17 +109,27 @@ static bool    vcom_state = false;
 
 // =============================================================================
 // IMU axis transform - single source of truth for raw sensor -> board frame
-// (fwd, left, up). IMU was relocated from top to bottom of PCB; old signs
-// are invalid. Signs left at +1 (identity) until remeasured - do NOT guess.
-// Axis-source mapping (which raw axis feeds which board axis) is preserved
-// from the old top-mount remap: raw X<->Y swapped, Z straight through.
+// (fwd, left, up). Axis-source mapping (which raw axis feeds which board
+// axis) is preserved from the old top-mount remap: raw X<->Y swapped, Z
+// straight through.
+//
+// rev2: IMU faces UP (rev1 faced DOWN) - a 180 degree flip. A 180 flip
+// inverts the board-normal (Z) axis AND exactly one in-plane axis; negating
+// only Z would be a reflection (det -1, left-handed, breaks Madgwick). So:
+// Z negation is removed (AZ_SIGN/GZ_SIGN back to +1), and exactly one
+// in-plane axis is negated instead.
+// DEFAULT assumes flip about the forward/roll axis -> negate the Y source
+// (AX_SIGN/GX_SIGN, since raw Y feeds board FWD per the swap above). Flip
+// axis is NOT confirmed - this is a one-line toggle. VERIFY on bench:
+//   level+still -> lean ~0, pitch ~0, stable.
+//   tilt top to rider's right -> lean should be positive / "R".
 // =============================================================================
-#define AX_SIGN  +1   // sign applied to raw axis feeding board FWD accel
+#define AX_SIGN  -1   // sign applied to raw axis feeding board FWD accel (rev2 flip default)
 #define AY_SIGN  +1   // sign applied to raw axis feeding board LEFT accel
-#define AZ_SIGN  +1   // sign applied to raw axis feeding board UP accel
-#define GX_SIGN  +1   // sign applied to raw axis feeding board FWD gyro
+#define AZ_SIGN  +1   // sign applied to raw axis feeding board UP accel (Z negation removed for rev2)
+#define GX_SIGN  -1   // sign applied to raw axis feeding board FWD gyro (rev2 flip default)
 #define GY_SIGN  +1   // sign applied to raw axis feeding board LEFT gyro
-#define GZ_SIGN  +1   // sign applied to raw axis feeding board UP gyro
+#define GZ_SIGN  +1   // sign applied to raw axis feeding board UP gyro (Z negation removed for rev2)
 
 static void imuTransformAxes(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                               int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
