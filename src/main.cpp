@@ -8,6 +8,13 @@
 #include <BLE2902.h>
 
 // =============================================================================
+// Debug flags (override via -D<FLAG>=1 in build_flags; defaults are OFF)
+// =============================================================================
+#ifndef GPS_DEBUG
+#define GPS_DEBUG 0
+#endif
+
+// =============================================================================
 // Pin definitions (rev2)
 // =============================================================================
 // I2C (IMU)
@@ -817,7 +824,7 @@ void loop() {
 #endif
     }
 
-#ifdef GPS_DEBUG
+#if GPS_DEBUG
     // Raw GPS passthrough — confirms module is talking before NMEA parsing is added
     while (Serial1.available()) Serial.write(Serial1.read());
 #endif
