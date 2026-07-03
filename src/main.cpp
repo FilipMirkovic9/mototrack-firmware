@@ -144,13 +144,11 @@ static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 #define LEAN_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define BLE_NOTIFY_INTERVAL 100
 
-// BLE payload layout (little-endian, ESP32 native byte order, 16 bytes):
-//   bytes  0-3:  lean     [f32]
-//   bytes  4-7:  pitch    [f32]
-//   bytes  8-11: battPct  [f32]
-//   bytes 12-15: powerFlags [u32] — parse as little-endian uint32 on mobile
-#define PWR_BIT_USB_PRESENT  (1u << 0)  // set when PGOOD_PIN LOW (USB connected)
-// bits 1-31: reserved, always 0
+// Payload = 16 bytes, little-endian (ESP32 native):
+//   [0..3] float lean   [4..7] float pitch   [8..11] float battPct
+//   [12..15] uint32 powerFlags
+#define PWRFLAG_USB_PRESENT  (1u << 0)   // bit0: USB present (PGOOD == LOW)
+// bits 1..31 reserved, keep 0
 
 static BLECharacteristic *pLeanCharacteristic = nullptr;
 static bool bleClientConnected              = false;
@@ -852,7 +850,7 @@ void loop() {
             float pitch = g_pitchAngle;
             float batt  = g_battPct;
             uint32_t powerFlags = 0;
-            if (digitalRead(PGOOD_PIN) == LOW) powerFlags |= PWR_BIT_USB_PRESENT;
+            if (digitalRead(PGOOD_PIN) == LOW) powerFlags |= PWRFLAG_USB_PRESENT;
             uint8_t payload[16];
             memcpy(payload + 0,  &lean,       4);
             memcpy(payload + 4,  &pitch,      4);
