@@ -8,28 +8,43 @@
 #include <BLE2902.h>
 
 // =============================================================================
-// Pin definitions
+// Pin definitions (rev2)
 // =============================================================================
-#define SDA_PIN       4
-#define SCL_PIN       5
-#define BTN_UP        8
-#define BTN_DOWN      3
-#define BTN_SELECT    38
-#define PGOOD_PIN     14
+// I2C (IMU)
+#define I2C_SDA_PIN    4
+#define I2C_SCL_PIN    5
+
+// Buttons (active LOW, INPUT_PULLUP)
+#define BTN_UP_PIN     8
+#define BTN_DOWN_PIN   3
+#define BTN_SELECT_PIN 38
+
+// Power/charger monitor - active LOW = USB present
+// NOTE: rev1 had LED_POWER on pin 21; rev2 repurposes pin 21 as PGOOD_PIN.
+//       LED_POWER has been removed.
+#define PGOOD_PIN      21
 
 // LEDs - active high
-#define LED_POWER     21
 #define LED_STATUS    17
 #define LED_CHARGE    18
 
-// Battery ADC
-#define BATT_ADC_PIN  1
+// Battery ADC (VBAT/2 voltage divider on BATT_ADC_PIN)
+#define BATT_ADC_PIN   1
 
-// Flash (W25Q512) - rev1 pins
-#define FLASH_CS_PIN  9
-#define FLASH_SCLK    6
-#define FLASH_MOSI    7
-#define FLASH_MISO    13
+// GPS (MAX-M10S, UART)
+#define GPS_RX_PIN    15   // ESP32 RX <- GPS TXD
+#define GPS_TX_PIN    16   // ESP32 TX -> GPS RXD
+
+// IMU interrupt
+#define IMU_INT1_PIN   2
+
+// SPI bus — shared between display and flash; two CS lines: DISP_CS=12, FLASH_CS=9
+#define SPI_SCLK_PIN  14
+#define SPI_MOSI_PIN  13
+#define SPI_MISO_PIN  47
+
+// Flash (W25Q512)
+#define FLASH_CS_PIN   9
 
 // W25Q512 commands
 #define FLASH_CMD_JEDEC_ID    0x9F
@@ -50,11 +65,11 @@
 // =============================================================================
 // Display (Sharp LS027B7DH01)
 // =============================================================================
-#define DISP_SCLK     6
-#define DISP_MOSI     7
-#define DISP_CS       10
+#define DISP_SCLK     SPI_SCLK_PIN  // shared SPI bus (pin 14)
+#define DISP_MOSI     SPI_MOSI_PIN  // shared SPI bus (pin 13)
+#define DISP_CS       12
 #define DISP_EXTCOMIN 11
-#define DISP_DISP     12
+#define DISP_DISP     10
 #define DISP_WIDTH    400
 #define DISP_HEIGHT   240
 #define DISP_BYTES_PER_LINE  (DISP_WIDTH / 8)
@@ -86,6 +101,33 @@ static bool    vcom_state = false;
 #define RAD_TO_DEG    (180.0f / M_PI)
 
 // =============================================================================
+// IMU axis transform - single source of truth for raw sensor -> board frame
+// (fwd, left, up). IMU was relocated from top to bottom of PCB; old signs
+// are invalid. Signs left at +1 (identity) until remeasured - do NOT guess.
+// Axis-source mapping (which raw axis feeds which board axis) is preserved
+// from the old top-mount remap: raw X<->Y swapped, Z straight through.
+// =============================================================================
+#define AX_SIGN  +1   // sign applied to raw axis feeding board FWD accel
+#define AY_SIGN  +1   // sign applied to raw axis feeding board LEFT accel
+#define AZ_SIGN  +1   // sign applied to raw axis feeding board UP accel
+#define GX_SIGN  +1   // sign applied to raw axis feeding board FWD gyro
+#define GY_SIGN  +1   // sign applied to raw axis feeding board LEFT gyro
+#define GZ_SIGN  +1   // sign applied to raw axis feeding board UP gyro
+
+static void imuTransformAxes(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
+                              int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
+                              float &ax, float &ay, float &az,
+                              float &gx, float &gy, float &gz) {
+    // Axis-source mapping: board FWD/LEFT <- raw Y/X (swapped), UP <- raw Z
+    ax = AX_SIGN * ay_raw * ACCEL_SCALE;
+    ay = AY_SIGN * ax_raw * ACCEL_SCALE;
+    az = AZ_SIGN * az_raw * ACCEL_SCALE;
+    gx = GX_SIGN * gy_raw * GYRO_SCALE * DEG_TO_RAD;
+    gy = GY_SIGN * gx_raw * GYRO_SCALE * DEG_TO_RAD;
+    gz = GZ_SIGN * gz_raw * GYRO_SCALE * DEG_TO_RAD;
+}
+
+// =============================================================================
 // Madgwick
 // =============================================================================
 #define SAMPLE_HZ   100.0f
@@ -102,6 +144,14 @@ static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
 #define LEAN_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define BLE_NOTIFY_INTERVAL 100
 
+// BLE payload layout (little-endian, ESP32 native byte order, 16 bytes):
+//   bytes  0-3:  lean     [f32]
+//   bytes  4-7:  pitch    [f32]
+//   bytes  8-11: battPct  [f32]
+//   bytes 12-15: powerFlags [u32] — parse as little-endian uint32 on mobile
+#define PWR_BIT_USB_PRESENT  (1u << 0)  // set when PGOOD_PIN LOW (USB connected)
+// bits 1-31: reserved, always 0
+
 static BLECharacteristic *pLeanCharacteristic = nullptr;
 static bool bleClientConnected              = false;
 static bool bleClientWasPreviouslyConnected = false;
@@ -112,7 +162,15 @@ static BLEServer *pServer                   = nullptr;
 // =============================================================================
 static volatile float g_leanAngle  = 0.0f;
 static volatile float g_pitchAngle = 0.0f;
+static volatile float g_ax = 0.0f;
+static volatile float g_ay = 0.0f;
+static volatile float g_az = 0.0f;
 static volatile float g_battPct    = 0.0f;
+
+// Gyro bias (raw units, sensor axes, pre-scale/pre-remap) from startup calibration
+static float g_gyroBiasX = 0.0f;
+static float g_gyroBiasY = 0.0f;
+static float g_gyroBiasZ = 0.0f;
 
 // =============================================================================
 // Buttons
@@ -267,7 +325,7 @@ void displayInit() {
     pinMode(DISP_DISP,     OUTPUT); digitalWrite(DISP_DISP, LOW);
     pinMode(DISP_EXTCOMIN, OUTPUT); digitalWrite(DISP_EXTCOMIN, LOW);
 
-    dispSPI.begin(DISP_SCLK, FLASH_MISO, DISP_MOSI, DISP_CS);
+    dispSPI.begin(SPI_SCLK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, DISP_CS);
 
     delay(10);
     digitalWrite(DISP_DISP, HIGH);
@@ -500,6 +558,62 @@ static void imuReadRegs(uint8_t reg, uint8_t *buf, uint8_t len) {
 }
 
 // =============================================================================
+// Gyro bias calibration (run once at startup, board assumed stationary)
+// =============================================================================
+#define GYRO_CAL_SAMPLES 200
+
+static void calibrateGyroBias() {
+    int32_t sumX = 0, sumY = 0, sumZ = 0;
+    for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+        uint8_t buf[6];
+        imuReadRegs(REG_OUTX_L_G, buf, 6);
+        int16_t gx_raw = (int16_t)((buf[1] << 8) | buf[0]);
+        int16_t gy_raw = (int16_t)((buf[3] << 8) | buf[2]);
+        int16_t gz_raw = (int16_t)((buf[5] << 8) | buf[4]);
+        sumX += gx_raw;
+        sumY += gy_raw;
+        sumZ += gz_raw;
+        delay((uint32_t)(DT * 1000.0f));
+    }
+    g_gyroBiasX = (float)sumX / GYRO_CAL_SAMPLES;
+    g_gyroBiasY = (float)sumY / GYRO_CAL_SAMPLES;
+    g_gyroBiasZ = (float)sumZ / GYRO_CAL_SAMPLES;
+    Serial.printf("GYRO CAL: biasX=%.2f biasY=%.2f biasZ=%.2f (raw)\n",
+                  g_gyroBiasX, g_gyroBiasY, g_gyroBiasZ);
+}
+
+#ifdef RAW_AXIS_DEBUG
+// Temporary diagnostic: prints raw accel/gyro straight from the IMU driver,
+// before any remap and before Madgwick. Independent 5Hz read, separate from
+// the 100Hz fusion loop.
+static void printRawIMU() {
+    static uint32_t lastRawDbgMs = 0;
+    uint32_t now = millis();
+    if (now - lastRawDbgMs < 200) return;
+    lastRawDbgMs = now;
+
+    uint8_t buf[12];
+    imuReadRegs(REG_OUTX_L_G, buf, 12);
+    int16_t gx_raw = (int16_t)((buf[1]  << 8) | buf[0]);
+    int16_t gy_raw = (int16_t)((buf[3]  << 8) | buf[2]);
+    int16_t gz_raw = (int16_t)((buf[5]  << 8) | buf[4]);
+    int16_t ax_raw = (int16_t)((buf[7]  << 8) | buf[6]);
+    int16_t ay_raw = (int16_t)((buf[9]  << 8) | buf[8]);
+    int16_t az_raw = (int16_t)((buf[11] << 8) | buf[10]);
+
+    float ax = ax_raw * ACCEL_SCALE;
+    float ay = ay_raw * ACCEL_SCALE;
+    float az = az_raw * ACCEL_SCALE;
+    float gx = gx_raw * GYRO_SCALE;
+    float gy = gy_raw * GYRO_SCALE;
+    float gz = gz_raw * GYRO_SCALE;
+
+    Serial.printf("RAW ax=%.3f ay=%.3f az=%.3f gx=%.2f gy=%.2f gz=%.2f\n",
+                  ax, ay, az, gx, gy, gz);
+}
+#endif
+
+// =============================================================================
 // Madgwick
 // =============================================================================
 static void madgwickUpdate(float ax, float ay, float az,
@@ -555,13 +669,13 @@ static bool buttonPressed(uint8_t pin, uint32_t &lastMs) {
 }
 
 static void handleButtons() {
-    if (buttonPressed(BTN_UP, btnUpLastMs)) {
+    if (buttonPressed(BTN_UP_PIN, btnUpLastMs)) {
         Serial.println("BTN_UP pressed");
     }
-    if (buttonPressed(BTN_DOWN, btnDownLastMs)) {
+    if (buttonPressed(BTN_DOWN_PIN, btnDownLastMs)) {
         Serial.println("BTN_DOWN pressed");
     }
-    if (buttonPressed(BTN_SELECT, btnSelectLastMs)) {
+    if (buttonPressed(BTN_SELECT_PIN, btnSelectLastMs)) {
         Serial.println("BTN_SELECT pressed");
     }
 }
@@ -586,15 +700,14 @@ void setup() {
     Serial.println("MotoTrack - BOOT");
 
     // LEDs
-    pinMode(LED_POWER,  OUTPUT); digitalWrite(LED_POWER,  HIGH);
     pinMode(LED_CHARGE, OUTPUT); digitalWrite(LED_CHARGE, LOW);
     pinMode(LED_STATUS, OUTPUT); digitalWrite(LED_STATUS, LOW);
 
-    // Buttons and PGOOD
-    pinMode(BTN_UP,     INPUT_PULLUP);
-    pinMode(BTN_DOWN,   INPUT_PULLUP);
-    pinMode(BTN_SELECT, INPUT_PULLUP);
-    pinMode(PGOOD_PIN,  INPUT);
+    // Buttons and PGOOD (all active LOW)
+    pinMode(BTN_UP_PIN,     INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN,   INPUT_PULLUP);
+    pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
+    pinMode(PGOOD_PIN,      INPUT);
 
     // Battery ADC
     analogReadResolution(12);
@@ -605,7 +718,11 @@ void setup() {
     flashDeselect();
 
     // I2C for IMU
-    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // GPS UART
+    Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    Serial.println("GPS: UART init 9600 8N1");
 
     // IMU
     uint8_t who = imuReadReg(REG_WHO_AM_I);
@@ -616,6 +733,9 @@ void setup() {
     Serial.println("IMU: detected");
     imuWriteReg(REG_CTRL1_XL, 0x48);
     imuWriteReg(REG_CTRL2_G,  0x4C);
+
+    // Gyro bias calibration - board must be stationary during boot
+    calibrateGyroBias();
 
     // Display - inits the shared SPI bus
     displayInit();
@@ -650,6 +770,10 @@ void loop() {
 
     handleButtons();
 
+#ifdef RAW_AXIS_DEBUG
+    printRawIMU();
+#endif
+
     // -- IMU at 100Hz --------------------------------------------------------
     static uint32_t lastImuMs = 0;
     if (now - lastImuMs >= (uint32_t)(DT * 1000.0f)) {
@@ -662,12 +786,12 @@ void loop() {
         int16_t ax_raw = (int16_t)((buf[7]  << 8) | buf[6]);
         int16_t ay_raw = (int16_t)((buf[9]  << 8) | buf[8]);
         int16_t az_raw = (int16_t)((buf[11] << 8) | buf[10]);
-        float ax =  ay_raw * ACCEL_SCALE;
-        float ay =  ax_raw * ACCEL_SCALE;
-        float az = -az_raw * ACCEL_SCALE;
-        float gx =  gy_raw * GYRO_SCALE * DEG_TO_RAD;
-        float gy =  gx_raw * GYRO_SCALE * DEG_TO_RAD;
-        float gz = -gz_raw * GYRO_SCALE * DEG_TO_RAD;
+        gx_raw -= (int16_t)lroundf(g_gyroBiasX);
+        gy_raw -= (int16_t)lroundf(g_gyroBiasY);
+        gz_raw -= (int16_t)lroundf(g_gyroBiasZ);
+        float ax, ay, az, gx, gy, gz;
+        imuTransformAxes(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw,
+                          ax, ay, az, gx, gy, gz);
         madgwickUpdate(ax, ay, az, gx, gy, gz);
         float roll  = atan2f(2.0f*(q0*q1 + q2*q3), 1.0f - 2.0f*(q1*q1 + q2*q2)) * RAD_TO_DEG;
         float pitch = asinf (2.0f*(q0*q2 - q3*q1))                               * RAD_TO_DEG;
@@ -676,7 +800,29 @@ void loop() {
         if (lean < -90.0f) lean = -180.0f - lean;
         g_leanAngle  = lean;
         g_pitchAngle = pitch;
+        g_ax = ax;
+        g_ay = ay;
+        g_az = az;
+
+#ifdef AXIS_DEBUG
+        static uint32_t lastAxisDbgMs = 0;
+        if (now - lastAxisDbgMs >= 500) {
+            lastAxisDbgMs = now;
+            float rawAxG = ax_raw * ACCEL_SCALE;
+            float rawAyG = ay_raw * ACCEL_SCALE;
+            float rawAzG = az_raw * ACCEL_SCALE;
+            Serial.printf("AXIS RAW ax=%.2f ay=%.2f az=%.2f (g)  "
+                          "TRANSFORMED fwd=%.2f left=%.2f up=%.2f (g)  "
+                          "lean=%.1f pitch=%.1f (deg)\n",
+                          rawAxG, rawAyG, rawAzG, ax, ay, az, lean, pitch);
+        }
+#endif
     }
+
+#ifdef GPS_DEBUG
+    // Raw GPS passthrough — confirms module is talking before NMEA parsing is added
+    while (Serial1.available()) Serial.write(Serial1.read());
+#endif
 
     // -- Battery ADC at 1Hz --------------------------------------------------
     static uint32_t lastBattMs = 0;
@@ -705,12 +851,12 @@ void loop() {
             float lean  = g_leanAngle;
             float pitch = g_pitchAngle;
             float batt  = g_battPct;
-            uint8_t payload[16];
-            memcpy(payload + 0,  &lean,  4);
-            memcpy(payload + 4,  &pitch, 4);
-            memcpy(payload + 8,  &batt,  4);
             uint32_t powerFlags = 0;
-            if (usbPresent) powerFlags |= (1u << 0);
+            if (digitalRead(PGOOD_PIN) == LOW) powerFlags |= PWR_BIT_USB_PRESENT;
+            uint8_t payload[16];
+            memcpy(payload + 0,  &lean,       4);
+            memcpy(payload + 4,  &pitch,      4);
+            memcpy(payload + 8,  &batt,       4);
             memcpy(payload + 12, &powerFlags, 4);
             pLeanCharacteristic->setValue(payload, sizeof(payload));
             pLeanCharacteristic->notify();
