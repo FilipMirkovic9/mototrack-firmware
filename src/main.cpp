@@ -8,10 +8,16 @@
 #include <BLE2902.h>
 
 // =============================================================================
-// Debug flags (override via -D<FLAG>=1 in build_flags; defaults are OFF)
+// Debug flags (override via -D<FLAG>=1 in build_flags; defaults noted below)
 // =============================================================================
 #ifndef GPS_DEBUG
 #define GPS_DEBUG 0
+#endif
+
+// Temporary: confirms the rev2 axis remap. Default ON until confirmed on
+// bench, then remove.
+#ifndef IMU_DEBUG
+#define IMU_DEBUG 1
 #endif
 
 // =============================================================================
@@ -109,39 +115,22 @@ static bool    vcom_state = false;
 
 // =============================================================================
 // IMU axis transform - single source of truth for raw sensor -> board frame
-// (fwd, left, up). Axis-source mapping (which raw axis feeds which board
-// axis) is preserved from the old top-mount remap: raw X<->Y swapped, Z
-// straight through.
+// (fwd, left, up).
 //
-// rev2: IMU faces UP (rev1 faced DOWN) - a 180 degree flip. A 180 flip
-// inverts the board-normal (Z) axis AND exactly one in-plane axis; negating
-// only Z would be a reflection (det -1, left-handed, breaks Madgwick). So:
-// Z negation is removed (AZ_SIGN/GZ_SIGN back to +1), and exactly one
-// in-plane axis is negated instead.
-// DEFAULT assumes flip about the forward/roll axis -> negate the Y source
-// (AX_SIGN/GX_SIGN, since raw Y feeds board FWD per the swap above). Flip
-// axis is NOT confirmed - this is a one-line toggle. VERIFY on bench:
-//   level+still -> lean ~0, pitch ~0, stable.
-//   tilt top to rider's right -> lean should be positive / "R".
+// rev2 mounting (IMU faces UP). Signs derived from bench data, not guessed:
+// a left lean put +0.41g on raw X (lateral) with raw Y ~0 (roll axis), so
+// body Y must = -raw X for left lean -> negative roll. Z is not negated.
 // =============================================================================
-#define AX_SIGN  -1   // sign applied to raw axis feeding board FWD accel (rev2 flip default)
-#define AY_SIGN  +1   // sign applied to raw axis feeding board LEFT accel
-#define AZ_SIGN  +1   // sign applied to raw axis feeding board UP accel (Z negation removed for rev2)
-#define GX_SIGN  -1   // sign applied to raw axis feeding board FWD gyro (rev2 flip default)
-#define GY_SIGN  +1   // sign applied to raw axis feeding board LEFT gyro
-#define GZ_SIGN  +1   // sign applied to raw axis feeding board UP gyro (Z negation removed for rev2)
-
 static void imuTransformAxes(int16_t ax_raw, int16_t ay_raw, int16_t az_raw,
                               int16_t gx_raw, int16_t gy_raw, int16_t gz_raw,
                               float &ax, float &ay, float &az,
                               float &gx, float &gy, float &gz) {
-    // Axis-source mapping: board FWD/LEFT <- raw Y/X (swapped), UP <- raw Z
-    ax = AX_SIGN * ay_raw * ACCEL_SCALE;
-    ay = AY_SIGN * ax_raw * ACCEL_SCALE;
-    az = AZ_SIGN * az_raw * ACCEL_SCALE;
-    gx = GX_SIGN * gy_raw * GYRO_SCALE * DEG_TO_RAD;
-    gy = GY_SIGN * gx_raw * GYRO_SCALE * DEG_TO_RAD;
-    gz = GZ_SIGN * gz_raw * GYRO_SCALE * DEG_TO_RAD;
+    ax =  ay_raw * ACCEL_SCALE;             // body X = forward (raw Y)
+    ay = -ax_raw * ACCEL_SCALE;             // body Y = left    (-raw X)
+    az =  az_raw * ACCEL_SCALE;             // body Z = up      (raw Z)
+    gx =  gy_raw * GYRO_SCALE * DEG_TO_RAD;
+    gy = -gx_raw * GYRO_SCALE * DEG_TO_RAD;
+    gz =  gz_raw * GYRO_SCALE * DEG_TO_RAD;
 }
 
 // =============================================================================
@@ -188,12 +177,45 @@ static float g_gyroBiasY = 0.0f;
 static float g_gyroBiasZ = 0.0f;
 
 // =============================================================================
-// Buttons
+// Screens / track mode
+// UI skeleton only - nav/accel/lap/session/GPS/storage fields below are
+// placeholders until GPS NMEA parsing and flash ride-logging exist.
+//
+// Main MODE cycle is NAV -> LAP -> ACC -> TRIP -> NAV (4 screens). STATUS is
+// a side door (SELECT long-press), not part of the cycle.
 // =============================================================================
-#define BTN_DEBOUNCE_MS  50
-static uint32_t btnUpLastMs     = 0;
-static uint32_t btnDownLastMs   = 0;
-static uint32_t btnSelectLastMs = 0;
+enum ScreenId {
+    SCREEN_NAV = 0,   // default on power-up
+    SCREEN_LAP,
+    SCREEN_ACC,
+    SCREEN_TRIP,
+    SCREEN_STATUS,    // reachable only via SELECT long-press
+    SCREEN_COUNT
+};
+#define MAIN_SCREEN_COUNT 4  // NAV, LAP, ACC, TRIP - STATUS is excluded from cycling
+static ScreenId g_currentScreen = SCREEN_NAV;
+
+enum TrackState { TRACK_IDLE, TRACK_ARMED };
+static TrackState g_trackState = TRACK_IDLE;
+
+// =============================================================================
+// Buttons
+// MODE (BTN_UP): short press cycles NAV/LAP/ACC/TRIP forward, long press
+// arms/disarms track mode. SELECT: short press cycles the same 4 screens
+// backward; long press jumps to STATUS (a short press on either button from
+// STATUS returns to NAV). BTN_DOWN is not used by this UI yet.
+// =============================================================================
+#define BTN_DEBOUNCE_MS   50
+#define BTN_LONGPRESS_MS 600
+static uint32_t btnDownLastMs = 0;
+
+struct ButtonHoldState {
+    bool     held         = false;
+    uint32_t pressStartMs = 0;
+    bool     longFired    = false;
+};
+static ButtonHoldState btnModeState;
+static ButtonHoldState btnSelectState;
 
 // =============================================================================
 // SPI buses
@@ -433,7 +455,7 @@ static const uint8_t font5x7[][5] = {
     {0x3E,0x41,0x41,0x41,0x22}, // C
     {0x7F,0x09,0x19,0x29,0x46}, // R
     {0x7C,0x12,0x11,0x12,0x7C}, // A
-    {0x7F,0x49,0x49,0x49,0x41}, // F
+    {0x7F,0x49,0x49,0x49,0x41}, // E (was mislabeled "F" - this bitmap is E's, not F's)
     {0x7F,0x40,0x40,0x40,0x40}, // L
     {0x3E,0x41,0x41,0x41,0x3E}, // O
     {0x3F,0x40,0x38,0x40,0x3F}, // W
@@ -444,9 +466,10 @@ static const uint8_t font5x7[][5] = {
     {0x7F,0x41,0x41,0x41,0x3E}, // D
     {0x01,0x01,0x7F,0x01,0x01}, // T
     {0x3F,0x40,0x40,0x40,0x3F}, // V
-    {0x7F,0x10,0x08,0x04,0x7F}, // N
+    {0x7F,0x04,0x08,0x10,0x7F}, // N (fixed: diagonal was running bottom-left to top-right - backwards, like a mirrored N/Cyrillic И. Verified geometrically: rows should increase left-to-right for a proper N diagonal, and this is now internally consistent with Z's diagonal running the opposite way, as expected for two visually-related but distinct letterforms)
     {0x3E,0x41,0x49,0x49,0x7A}, // G
-    {0x7F,0x09,0x09,0x01,0x01}, // F dup
+    {0x7F,0x09,0x09,0x09,0x01}, // F (correct bitmap; the old "F" slot above actually held E's shape and the old copy here had a typo'd 4th byte, 0x01 instead of 0x09)
+    {0x20,0x40,0x41,0x3F,0x01}, // J (not bench-verified - lower confidence, no reference file to check against)
     {0x7F,0x08,0x08,0x08,0x7F}, // H
     {0x63,0x14,0x08,0x14,0x63}, // X
     {0x46,0x49,0x49,0x49,0x31}, // S dup
@@ -457,7 +480,7 @@ static const uint8_t font5x7[][5] = {
     {0x36,0x41,0x00,0x41,0x36}, // ()
     {0x7F,0x41,0x41,0x22,0x1C}, // D dup
     {0x7F,0x01,0x01,0x01,0x01}, // L/G
-    {0x7F,0x48,0x44,0x42,0x41}, // K
+    {0x7F,0x08,0x14,0x22,0x41}, // K (fixed: old bytes had bit6 set in nearly every column - a spurious bottom bar - instead of a proper second diagonal; new value is two diagonals radiating from a vertex on the stroke, spreading evenly to the top-right and bottom-right corners)
     {0x3E,0x41,0x41,0x41,0x41}, // C dup
     {0x7F,0x44,0x44,0x44,0x38}, // R dup
 };
@@ -468,12 +491,16 @@ static int charToFontIndex(char c) {
         case ' ': return 10; case '.': return 11; case '-': return 12;
         case 'P': return 13; case 'I': return 14; case 'M': return 15;
         case 'C': return 16; case 'R': return 17; case 'A': return 18;
-        case 'F': return 19; case 'L': return 20; case 'O': return 21;
+        case 'E': return 19; case 'L': return 20; case 'O': return 21;
         case 'W': return 22; case 'U': return 23; case 'S': return 24;
         case 'B': return 25; case 'D': return 27; case 'T': return 28;
         case 'V': return 29; case 'N': return 30; case 'G': return 31;
-        case 'H': return 33; case 'X': return 34; case 'Y': return 37;
-        case 'Z': return 38; case 'K': return 43;
+        case 'F': return 32; case 'J': return 33; case 'H': return 34;
+        case 'X': return 35; case 'Y': return 38; case 'Z': return 39;
+        case 'K': return 44;
+        // 'Q' is still unmapped (falls through to space): no reference file
+        // to verify a reconstructed bitmap against, so left out rather than
+        // guessed. Add it once a known-good glyph is available.
         default:  return 10;
     }
 }
@@ -493,6 +520,102 @@ void displayDrawText(int x, int y, const char *text, int scale) {
         }
         cx += (5 + 1) * scale;
     }
+}
+
+// =============================================================================
+// Big numerals - hand-authored bitmap glyphs (24x34px native) for primary
+// readouts (speed, lean, lap times), replacing an earlier 7-segment
+// renderer that looked blocky/"digital clock" by construction.
+//
+// Generated as CONTINUOUS PATHS (arc samples and straight waypoints
+// concatenated into one point list per stroke, so consecutive segments
+// always share an exact endpoint) rather than independently angled
+// arcs/lines positioned by eye - the first version had visible gaps at
+// joints (e.g. the two humps of "3" not meeting) because nothing forced
+// them to connect. Verified with an automated hole-scan (flags any blank
+// pixel fully surrounded by ink) plus ASCII-art inspection before encoding.
+// See gen_digits2.py in scratchpad. Supports 0-9 and '-' only. Rendered
+// nearest-neighbor at an integer scale (1 = native 24x34px).
+// =============================================================================
+#define BIGNUM_W 24
+#define BIGNUM_H 34
+#define BIGNUM_ROW_BYTES 3
+
+static const uint8_t BIG_DIGIT_BITMAP[11][BIGNUM_H][BIGNUM_ROW_BYTES] = {
+{ {0x00,0x00,0x00}, {0x00,0x3E,0x00}, {0x00,0xFF,0x80}, {0x03,0xFF,0xE0}, {0x07,0xFF,0xF0}, {0x07,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x1F,0xE3,0xFC}, {0x1F,0xC1,0xFC}, {0x3F,0x80,0xFE}, {0x3F,0x80,0xFE}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x7E,0x00,0x3F}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x80,0xFE}, {0x3F,0x80,0xFE}, {0x1F,0xC1,0xFC}, {0x1F,0xE3,0xFC}, {0x0F,0xFF,0xF8}, {0x07,0xFF,0xF0}, {0x07,0xFF,0xF0}, {0x03,0xFF,0xE0}, {0x00,0xFF,0x80}, {0x00,0x3E,0x00} }, // 0
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x02,0x00}, {0x00,0x0F,0x80}, {0x00,0x3F,0x80}, {0x00,0x7F,0xC0}, {0x01,0xFF,0xC0}, {0x03,0xFF,0xC0}, {0x0F,0xFF,0xC0}, {0x0F,0xFF,0xC0}, {0x1F,0xFF,0xC0}, {0x0F,0xFF,0xC0}, {0x0F,0x9F,0xC0}, {0x02,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0xC0}, {0x0F,0xFF,0xF0}, {0x3F,0xFF,0xFC}, {0x3F,0xFF,0xFC}, {0x7F,0xFF,0xFE}, {0x3F,0xFF,0xFC}, {0x3F,0xFF,0xFC}, {0x0F,0xFF,0xF0} }, // 1
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0xFF,0x80}, {0x03,0xFF,0xE0}, {0x07,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x3F,0x80,0xFE}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3E,0x00,0x7E}, {0x1E,0x00,0x7E}, {0x00,0x00,0x7E}, {0x00,0x00,0xFE}, {0x00,0x01,0xFE}, {0x00,0x03,0xFC}, {0x00,0x07,0xF8}, {0x00,0x0F,0xF0}, {0x00,0x1F,0xF0}, {0x00,0x1F,0xE0}, {0x00,0x3F,0xC0}, {0x00,0x7F,0x80}, {0x00,0xFF,0x00}, {0x01,0xFE,0x00}, {0x03,0xFC,0x00}, {0x07,0xF8,0x00}, {0x0F,0xFF,0xF8}, {0x1F,0xFF,0xFE}, {0x1F,0xFF,0xFE}, {0x3F,0xFF,0xFF}, {0x1F,0xFF,0xFE}, {0x1F,0xFF,0xFE}, {0x07,0xFF,0xF8} }, // 2
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x03,0x80}, {0x00,0x07,0xC0}, {0x00,0x0F,0xE0}, {0x00,0x0F,0xF0}, {0x00,0x0F,0xF8}, {0x00,0x07,0xF8}, {0x00,0x01,0xF8}, {0x3E,0x01,0xFC}, {0x3F,0x80,0xFC}, {0x7F,0xE0,0xFC}, {0x7F,0xFF,0xFC}, {0x3F,0xFF,0xF8}, {0x3F,0xFF,0xF8}, {0x3F,0xFF,0xF8}, {0x1F,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x07,0xFF,0xF8}, {0x03,0xFF,0xF8}, {0x00,0x7D,0xFC}, {0x1C,0x00,0xFC}, {0x3E,0x00,0xFC}, {0x3F,0x01,0xFC}, {0x3F,0x01,0xF8}, {0x3F,0x83,0xF8}, {0x3F,0xFF,0xF8}, {0x1F,0xFF,0xF0}, {0x0F,0xFF,0xE0}, {0x07,0xFF,0xC0}, {0x03,0xFF,0x80}, {0x00,0xFE,0x00}, {0x00,0x00,0x00} }, // 3
+{ {0x00,0x00,0x00}, {0x00,0x00,0x40}, {0x00,0x01,0xF0}, {0x00,0x03,0xF0}, {0x00,0x07,0xF8}, {0x00,0x0F,0xF8}, {0x00,0x0F,0xF8}, {0x00,0x1F,0xF8}, {0x00,0x3F,0xF8}, {0x00,0x7F,0xF8}, {0x00,0xFF,0xF8}, {0x01,0xFF,0xF8}, {0x03,0xFF,0xF8}, {0x07,0xFB,0xF8}, {0x0F,0xF3,0xF8}, {0x1F,0xFF,0xF8}, {0x3F,0xFF,0xFE}, {0x3F,0xFF,0xFE}, {0x7F,0xFF,0xFF}, {0x3F,0xFF,0xFE}, {0x3F,0xFF,0xFE}, {0x0F,0xFF,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF8}, {0x00,0x01,0xF0}, {0x00,0x01,0xF0}, {0x00,0x00,0x40} }, // 4
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x07,0xFF,0xF0}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x3F,0xFF,0xFE}, {0x3F,0xFF,0xFC}, {0x3F,0xFF,0xFC}, {0x3F,0xFF,0xF0}, {0x3F,0x80,0x00}, {0x3F,0x80,0x00}, {0x3F,0x80,0x00}, {0x3F,0x80,0x00}, {0x3F,0xFF,0x00}, {0x3F,0xFF,0xC0}, {0x3F,0xFF,0xF0}, {0x3F,0xFF,0xF8}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x07,0xF9,0xFE}, {0x00,0x00,0xFE}, {0x00,0x00,0x7E}, {0x00,0x00,0x7E}, {0x00,0x00,0x7E}, {0x1F,0x00,0x7E}, {0x1F,0x80,0xFE}, {0x1F,0xC1,0xFE}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x0F,0xFF,0xF8}, {0x07,0xFF,0xF0}, {0x01,0xFF,0xC0}, {0x00,0x7F,0x00}, {0x00,0x00,0x00} }, // 5
+{ {0x03,0xFC,0x00}, {0x07,0xFE,0x00}, {0x07,0xFE,0x00}, {0x07,0xFF,0x00}, {0x07,0xFF,0x00}, {0x07,0xFF,0x00}, {0x07,0xFF,0x80}, {0x07,0xFF,0x80}, {0x07,0xFF,0xC0}, {0x07,0xEF,0xC0}, {0x07,0xFF,0xE0}, {0x07,0xFF,0xE0}, {0x03,0xFF,0xE0}, {0x03,0xFF,0xF0}, {0x03,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x1F,0xFF,0xFC}, {0x3F,0xC1,0xFE}, {0x3F,0x80,0xFE}, {0x3F,0x00,0xFE}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x80,0xFE}, {0x3F,0xC1,0xFE}, {0x1F,0xFF,0xFC}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x03,0xFF,0xE0}, {0x01,0xFF,0xC0}, {0x00,0x7F,0x00} }, // 6
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x0F,0xFF,0xF8}, {0x3F,0xFF,0xFE}, {0x3F,0xFF,0xFE}, {0x7F,0xFF,0xFF}, {0x3F,0xFF,0xFE}, {0x3F,0xFF,0xFE}, {0x0F,0xFF,0xFE}, {0x00,0x00,0xFC}, {0x00,0x00,0xFC}, {0x00,0x01,0xFC}, {0x00,0x01,0xF8}, {0x00,0x03,0xF8}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x07,0xF0}, {0x00,0x07,0xE0}, {0x00,0x07,0xE0}, {0x00,0x0F,0xE0}, {0x00,0x0F,0xC0}, {0x00,0x0F,0xC0}, {0x00,0x1F,0xC0}, {0x00,0x1F,0x80}, {0x00,0x3F,0x80}, {0x00,0x3F,0x00}, {0x00,0x3F,0x00}, {0x00,0x7F,0x00}, {0x00,0x7E,0x00}, {0x00,0x7E,0x00}, {0x00,0xFE,0x00}, {0x00,0x7C,0x00}, {0x00,0x7C,0x00}, {0x00,0x10,0x00} }, // 7
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x3E,0x00}, {0x00,0xFF,0x80}, {0x03,0xFF,0xE0}, {0x07,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x1F,0xE3,0xFC}, {0x1F,0xC1,0xFC}, {0x1F,0x80,0xFC}, {0x1F,0x80,0xFC}, {0x1F,0x80,0xFC}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x1F,0xFF,0xFC}, {0x1F,0xFF,0xFC}, {0x3F,0xBE,0xFE}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x80,0xFE}, {0x1F,0xE3,0xFC}, {0x1F,0xFF,0xFC}, {0x0F,0xFF,0xF8}, {0x07,0xFF,0xF0}, {0x03,0xFF,0xE0}, {0x01,0xFF,0xC0}, {0x00,0x3E,0x00} }, // 8
+{ {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x7F,0x00}, {0x01,0xFF,0xC0}, {0x03,0xFF,0xE0}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x1F,0xFF,0xFC}, {0x3F,0xC1,0xFE}, {0x3F,0x80,0xFE}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0x7E}, {0x3F,0x00,0xFE}, {0x3F,0x00,0xFE}, {0x3F,0x83,0xFE}, {0x3F,0xDF,0xFE}, {0x1F,0xFF,0xFC}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x03,0xFF,0xE0}, {0x01,0xFF,0xE0}, {0x00,0x7F,0xF0}, {0x00,0x07,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x03,0xF0}, {0x00,0x07,0xF0}, {0x00,0x07,0xF0} }, // 9
+    { {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x07,0xFF,0xF0}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x0F,0xFF,0xF8}, {0x07,0xFF,0xF0}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00}, {0x00,0x00,0x00} }, // -
+};
+
+static int bigDigitIndex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == '-') return 10;
+    return -1;
+}
+
+// Draws one glyph at native size * scale (nearest-neighbor blit, no
+// interpolation - scale 1 is native pixels, so still not "stretched").
+// Returns advance width in pixels.
+static int displayDrawBigGlyph(int x, int y, char c, int scale) {
+    int idx = bigDigitIndex(c);
+    int advance = (BIGNUM_W + 3) * scale;
+    if (idx < 0) return advance; // unsupported char: blank advance, no guess
+
+    for (int row = 0; row < BIGNUM_H; row++) {
+        for (int col = 0; col < BIGNUM_W; col++) {
+            uint8_t b = BIG_DIGIT_BITMAP[idx][row][col / 8];
+            if (!((b >> (7 - (col % 8))) & 0x01)) continue;
+            for (int sy = 0; sy < scale; sy++)
+                for (int sx = 0; sx < scale; sx++)
+                    displaySetPixel(x + col*scale + sx, y + row*scale + sy, false);
+        }
+    }
+    return advance;
+}
+
+// Draws a string of digits/'-'. Returns total pixel width drawn.
+static int displayDrawBigNumber(int x, int y, const char *text, int scale) {
+    int cx = x;
+    while (*text) cx += displayDrawBigGlyph(cx, y, *text++, scale);
+    return cx - x;
+}
+
+// =============================================================================
+// Circular arc gauge (monochrome: thin full ring + thicker arc for the
+// filled portion, since there's no color/shading to distinguish fill vs
+// track on a 1-bit panel).
+// =============================================================================
+static void displayDrawArc(int cx, int cy, int r, int thickness, float startDeg, float endDeg) {
+    for (float deg = startDeg; deg <= endDeg; deg += 1.0f) {
+        float rad = (deg - 90.0f) * DEG_TO_RAD; // 0deg = top, sweeps clockwise
+        float c = cosf(rad), s = sinf(rad);
+        for (int rr = r - thickness; rr <= r; rr++) {
+            displaySetPixel(cx + (int)(rr * c), cy + (int)(rr * s), false);
+        }
+    }
+}
+
+static void displayDrawGauge(int cx, int cy, int r, float pct, const char *label) {
+    displayDrawArc(cx, cy, r, 2, 0.0f, 359.0f);                    // thin track ring
+    if (pct > 0.0f) displayDrawArc(cx, cy, r, 8, 0.0f, 360.0f * (pct / 100.0f)); // filled arc
+
+    char pctStr[8];
+    snprintf(pctStr, sizeof(pctStr), "%d", (int)pct);
+    int scale = 3;
+    int textW = (int)strlen(pctStr) * (5 + 1) * scale;
+    displayDrawText(cx - textW/2, cy - (7*scale)/2, pctStr, scale);
+
+    int labelScale = 2;
+    int labelW = (int)strlen(label) * (5 + 1) * labelScale;
+    displayDrawText(cx - labelW/2, cy + r + 8, label, labelScale);
 }
 
 // =============================================================================
@@ -526,25 +649,130 @@ static float battVoltageToPct(float v) {
 }
 
 // =============================================================================
-// Telemetry screen
+// Screens
+// NOTE: layout below is NOT bench-verified against the physical MIP display -
+// coordinates are computed from font/glyph pixel math only. Expect to tweak
+// on first flash. Header convention: small font (scale 2, ~14px) top-left;
+// primary numerals use displayDrawBigNumber (native-size, not upscaled).
 // =============================================================================
-void displayUpdateTelemetry(float lean, float pitch, bool usbPresent, float battPct) {
+
+static void displayDrawScreenHeader(const char *title, TrackState trackState) {
+    displayDrawText(10, 8, title, 2);
+    displayDrawText(330, 8, trackState == TRACK_ARMED ? "ARM" : "OFF", 2);
+    displayFillRect(0, 28, 400, 2, false);
+}
+
+// Default screen: speed (left, placeholder - no GPS parsing yet), lean
+// (top-right corner, real data). No route source yet, so no center nav
+// readout beyond a placeholder heading dash. No bottom status bar - that
+// info (pitch/USB/battery) was cluttering this screen; battery still shows
+// on STATUS.
+void displayDrawNavScreen(float lean, float pitch, bool usbPresent, float battPct, TrackState trackState) {
+    (void)pitch; (void)usbPresent; (void)battPct; // not shown on this screen
     displayClear(true);
-    char leanStr[16];
-    snprintf(leanStr, sizeof(leanStr), "%d", (int)lean);
-    displayDrawText(10, 20, leanStr, 7);
-    const char *side = (lean < -1.0f) ? "L" : (lean > 1.0f) ? "R" : " ";
-    displayDrawText(330, 30, side, 6);
-    displayFillRect(0, 150, 400, 3, false);
-    char pitchStr[16];
-    snprintf(pitchStr, sizeof(pitchStr), "P %d", (int)pitch);
-    displayDrawText(10, 170, pitchStr, 3);
-    displayDrawText(220, 170, usbPresent ? "USB" : "BAT", 3);
-    char battStr[16];
-    snprintf(battStr, sizeof(battStr), "%d", (int)battPct);
-    displayDrawText(310, 170, battStr, 3);
-    displayDrawText(150, 215, "LEAN", 2);
+    displayDrawScreenHeader("NAV", trackState);
+
+    // SPD (left) - placeholder until GPS NMEA parsing exists
+    displayDrawText(20, 40, "SPD", 2);
+    displayDrawBigNumber(20, 62, "--", 2);       // 24x34 bitmap @2x = 48x68px, ends y=130
+    displayDrawText(20, 135, "KPH", 2);
+
+    // LEAN (top-right corner) - real data, magnitude only; side badge is
+    // fixed next to the "LEAN" label (NOT trailing the number - that
+    // overflowed off the 400px-wide panel once lean hit double digits and
+    // the number got wider, silently clipping the badge)
+    displayDrawText(285, 40, "LEAN", 2);
+    const char *side = (lean < -1.0f) ? "L" : (lean > 1.0f) ? "R" : "-";
+    displayDrawText(285 + 4*(5+1)*2 + 6, 40, side, 2);
+
+    char leanStr[8];
+    snprintf(leanStr, sizeof(leanStr), "%d", (int)fabsf(lean));
+    displayDrawBigNumber(285, 62, leanStr, 2);
+
+    // Nav heading placeholder - no route source yet
+    displayDrawText(175, 160, "---", 3);
+
     displayFlush();
+}
+
+void displayDrawLapScreen(TrackState trackState) {
+    displayClear(true);
+    displayDrawScreenHeader("LAP", trackState);
+
+    if (trackState == TRACK_ARMED) {
+        displayDrawText(20, 45, "TIME", 2);
+        displayDrawBigNumber(20, 68, "--", 2);
+        displayDrawText(20, 205, "LAST --.-   BST --.-", 2);
+    } else {
+        displayDrawText(20, 45, "NOT ARM", 3);
+        displayDrawText(20, 90, "LONG PRESS MODE TO START", 2);
+    }
+
+    displayFlush();
+}
+
+void displayDrawAccScreen() {
+    displayClear(true);
+    displayDrawScreenHeader("ACC", TRACK_IDLE);
+
+    displayDrawText(20, 40, "SPD", 2);
+    displayDrawBigNumber(20, 62, "--", 2);       // ends y=130
+    displayDrawText(20, 135, "KPH", 2);
+
+    displayDrawText(20, 155, "0-100 --.-", 3);
+    displayDrawText(20, 205, "NO DATA", 2);
+
+    displayFlush();
+}
+
+void displayDrawTripScreen() {
+    displayClear(true);
+    displayDrawScreenHeader("TRIP", TRACK_IDLE);
+
+    displayDrawText(20, 50,  "MAX LEAN  --", 3);
+    displayDrawText(20, 90,  "AVG SPD   --", 3);
+    displayDrawText(20, 130, "DIST      --", 3);
+    displayDrawText(20, 170, "TIME      --", 3);
+
+    displayFlush();
+}
+
+void displayDrawStatusScreen(float battPct) {
+    displayClear(true);
+    displayDrawText(10, 8, "STAT", 2);
+    displayFillRect(0, 28, 400, 2, false);
+
+    displayDrawGauge(140, 130, 70, battPct, "DEVICE");
+    // Phone battery gauge deferred - no BLE write path / expo-battery on the
+    // app side yet (see conversation notes). Slot reserved at (260,130).
+
+    displayDrawText(120, 215, "GPS NO ANT", 2);
+    displayDrawText(280, 215, "DISK --", 2);
+
+    displayFlush();
+}
+
+void displayUpdateScreen(ScreenId screen, float lean, float pitch, bool usbPresent,
+                          float battPct, TrackState trackState) {
+    switch (screen) {
+        case SCREEN_NAV:
+            displayDrawNavScreen(lean, pitch, usbPresent, battPct, trackState);
+            break;
+        case SCREEN_LAP:
+            displayDrawLapScreen(trackState);
+            break;
+        case SCREEN_ACC:
+            displayDrawAccScreen();
+            break;
+        case SCREEN_TRIP:
+            displayDrawTripScreen();
+            break;
+        case SCREEN_STATUS:
+            displayDrawStatusScreen(battPct);
+            break;
+        default:
+            break;
+    }
 }
 
 // =============================================================================
@@ -683,15 +911,66 @@ static bool buttonPressed(uint8_t pin, uint32_t &lastMs) {
     return false;
 }
 
-static void handleButtons() {
-    if (buttonPressed(BTN_UP_PIN, btnUpLastMs)) {
-        Serial.println("BTN_UP pressed");
+enum ButtonEvent { BTN_EVENT_NONE, BTN_EVENT_SHORT, BTN_EVENT_LONG };
+
+// Non-blocking press/hold/release tracker: fires SHORT on release (unless a
+// LONG already fired for this press), fires LONG once as soon as the hold
+// threshold is crossed while still held.
+static ButtonEvent pollButtonEvent(uint8_t pin, ButtonHoldState &st) {
+    bool isDown = (digitalRead(pin) == LOW);
+    uint32_t now = millis();
+    if (isDown && !st.held) {
+        st.held         = true;
+        st.pressStartMs = now;
+        st.longFired    = false;
+    } else if (isDown && st.held && !st.longFired) {
+        if (now - st.pressStartMs >= BTN_LONGPRESS_MS) {
+            st.longFired = true;
+            return BTN_EVENT_LONG;
+        }
+    } else if (!isDown && st.held) {
+        st.held = false;
+        if (!st.longFired && (now - st.pressStartMs) >= BTN_DEBOUNCE_MS) {
+            return BTN_EVENT_SHORT;
+        }
     }
+    return BTN_EVENT_NONE;
+}
+
+static void handleButtons() {
     if (buttonPressed(BTN_DOWN_PIN, btnDownLastMs)) {
         Serial.println("BTN_DOWN pressed");
     }
-    if (buttonPressed(BTN_SELECT_PIN, btnSelectLastMs)) {
-        Serial.println("BTN_SELECT pressed");
+
+    ButtonEvent modeEvt = pollButtonEvent(BTN_UP_PIN, btnModeState);
+    if (modeEvt == BTN_EVENT_SHORT) {
+        if (g_currentScreen == SCREEN_STATUS) {
+            g_currentScreen = SCREEN_NAV;
+        } else {
+            g_currentScreen = (ScreenId)((g_currentScreen + 1) % MAIN_SCREEN_COUNT);
+        }
+        Serial.printf("MODE: screen -> %d\n", (int)g_currentScreen);
+    } else if (modeEvt == BTN_EVENT_LONG) {
+        if (g_trackState == TRACK_IDLE) {
+            g_trackState = TRACK_ARMED;
+            Serial.println("MODE: track ARMED");
+        } else {
+            g_trackState = TRACK_IDLE;
+            Serial.println("MODE: track IDLE (session save not yet implemented)");
+        }
+    }
+
+    ButtonEvent selEvt = pollButtonEvent(BTN_SELECT_PIN, btnSelectState);
+    if (selEvt == BTN_EVENT_SHORT) {
+        if (g_currentScreen == SCREEN_STATUS) {
+            g_currentScreen = SCREEN_NAV;
+        } else {
+            g_currentScreen = (ScreenId)((g_currentScreen + MAIN_SCREEN_COUNT - 1) % MAIN_SCREEN_COUNT);
+        }
+        Serial.printf("SELECT: screen -> %d\n", (int)g_currentScreen);
+    } else if (selEvt == BTN_EVENT_LONG) {
+        g_currentScreen = SCREEN_STATUS;
+        Serial.println("SELECT: screen -> STATUS");
     }
 }
 
@@ -819,17 +1098,15 @@ void loop() {
         g_ay = ay;
         g_az = az;
 
-#ifdef AXIS_DEBUG
-        static uint32_t lastAxisDbgMs = 0;
-        if (now - lastAxisDbgMs >= 500) {
-            lastAxisDbgMs = now;
-            float rawAxG = ax_raw * ACCEL_SCALE;
-            float rawAyG = ay_raw * ACCEL_SCALE;
-            float rawAzG = az_raw * ACCEL_SCALE;
-            Serial.printf("AXIS RAW ax=%.2f ay=%.2f az=%.2f (g)  "
-                          "TRANSFORMED fwd=%.2f left=%.2f up=%.2f (g)  "
-                          "lean=%.1f pitch=%.1f (deg)\n",
-                          rawAxG, rawAyG, rawAzG, ax, ay, az, lean, pitch);
+#if IMU_DEBUG
+        static uint32_t lastImuDbgMs = 0;
+        if (now - lastImuDbgMs >= 500) {
+            lastImuDbgMs = now;
+            Serial.printf("RAW  ax=%.3f ay=%.3f az=%.3f  gx=%.2f gy=%.2f gz=%.2f\n",
+                          ax_raw * ACCEL_SCALE, ay_raw * ACCEL_SCALE, az_raw * ACCEL_SCALE,
+                          gx_raw * GYRO_SCALE,  gy_raw * GYRO_SCALE,  gz_raw * GYRO_SCALE);
+            Serial.printf("BODY ax=%.3f ay=%.3f az=%.3f\n", ax, ay, az);
+            Serial.printf("FUSED lean=%.1f pitch=%.1f\n", lean, pitch);
         }
 #endif
     }
@@ -892,7 +1169,7 @@ void loop() {
     if (now - lastDispMs >= 500) {
         lastDispMs = now;
         bool usbPresent = (digitalRead(PGOOD_PIN) == LOW);
-        displayUpdateTelemetry(g_leanAngle, g_pitchAngle, usbPresent, g_battPct);
+        displayUpdateScreen(g_currentScreen, g_leanAngle, g_pitchAngle, usbPresent, g_battPct, g_trackState);
     }
 
     // -- VCOM toggle at 1Hz --------------------------------------------------
