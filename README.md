@@ -26,7 +26,7 @@ bring-up to the phone client.
 
 ## Hardware
 
-Custom PCB, designed in KiCad, hand-assembled including SMD.
+Custom PCB, designed in KiCad, manufactured and assembled through JLCPCB's PCBA service.
 
 | | |
 |---|---|
