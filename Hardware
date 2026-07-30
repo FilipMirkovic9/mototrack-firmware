@@ -1,0 +1,69 @@
+# Hardware Notes
+
+Pin map, validated subsystems and known board issues (rev2 unless noted).
+Kept separate from the README so it stays a working reference during bring-up.
+
+Board: custom PCB, ESP32-S3-WROOM-1-N16R8 (16 MB flash, 8 MB PSRAM)
+Framework: Arduino via PlatformIO (env: esp32-s3-devkitc-1)
+
+## Build flags required (without these the board boot-loops)
+-DBOARD_HAS_PSRAM
+-DARDUINO_USB_MODE=1
+-DARDUINO_USB_CDC_ON_BOOT=1
+-mfix-esp32-psram-cache-issue
+
+## Pin map
+
+### I2C (IMU)
+SDA=IO4, SCL=IO5
+
+### IMU (LSM6DSO) — validated working
+I2C address 0x6A, WHO_AM_I=0x6C
+INT1 on IO2 (not currently used by firmware)
+
+### GPS (MAX-M10S, UART) — validated working
+RX=IO15 (ESP32 RX <- GPS TXD), TX=IO16 (ESP32 TX -> GPS RXD), 9600 baud
+NMEA RMC/GGA parsed, checksum-validated. No fix indoors — expected.
+
+### SPI bus (shared: display + flash, separate CS)
+SCLK=IO14, MOSI=IO13, MISO=IO47
+
+### Display (Sharp LS027B7DH01 MIP)
+CS=IO12, EXTCOMIN=IO11, DISP(enable)=IO10
+
+### Flash (W25Q512, 64 MB, 4-byte addressing)
+CS=IO9
+JEDEC ID validated at boot: MFR=0xEF, TYPE=0x40, CAP=0x20
+Read/write/erase self-test runs at boot (FLASH_SELFTEST)
+
+### Buttons (active LOW, INPUT_PULLUP)
+BTN_UP=IO8, BTN_DOWN=IO3, BTN_SELECT=IO38
+
+### Power monitoring
+PGOOD (USB present, active LOW)=IO21
+Battery voltage divider (VBAT/2) on ADC=IO1
+
+### LEDs (active HIGH)
+LED_STATUS=IO17, LED_CHARGE=IO18
+
+### Strapping / reset (not user I/O)
+BOOT=IO0 (strapping pin), RESET=EN
+
+## Known hardware issues (rev1, fixed in rev2)
+- J4 display connector pin order reversed after FPC fold, corrected in rev2.
+- USB-C data only worked in one CC orientation — USBLC6 ESD protection was
+  not in the D+/D- path for both orientations. Fixed in rev2.
+- rev1 had LED_POWER on IO21; rev2 repurposes IO21 as PGOOD (USB-present),
+  so anything referencing the old LED_POWER pin assignment is stale.
+
+## Firmware notes relevant to hardware bring-up
+
+- Gyro bias is calibrated at every boot (200-sample average). Board must be
+  stationary during the first ~2 seconds after power-up or the bias estimate
+  will be wrong for that session.
+- `RAW_AXIS_DEBUG` build flag prints raw accel/gyro directly from the driver
+  at 5 Hz, before axis remap and before fusion — the fastest way to tell a
+  wiring/I2C fault apart from a wrong axis remap or a fusion bug.
+- IMU update loop integrates against measured elapsed time (`micros()`), not
+  a fixed step, with a 100 ms clamp against runaway stalls. See README for
+  why this matters.
