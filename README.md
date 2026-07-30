@@ -8,7 +8,7 @@ application.
 Hardware, firmware and app are all my own work, from schematic through
 bring-up to the phone client.
 
-<img width="960" height="1280" alt="photo_2026-07-30_10-41-48" src="https://github.com/user-attachments/assets/b6f16e93-169c-446d-be60-983e9b2aba43" />
+<img width="480" height="640" alt="photo_2026-07-30_10-41-48" src="https://github.com/user-attachments/assets/b6f16e93-169c-446d-be60-983e9b2aba43" />
 
 ## Status
 
