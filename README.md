@@ -8,7 +8,8 @@ application.
 Hardware, firmware and app are all my own work, from schematic through
 bring-up to the phone client.
 
-![Assembled rev2 board](docs/img/board.jpg)
+<img width="960" height="1280" alt="image" src="https://github.com/user-attachments/assets/fe1da095-f2d0-4784-a69d-8545bf2790fc" />
+
 
 ## Status
 
